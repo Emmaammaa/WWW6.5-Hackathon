@@ -1,5 +1,8 @@
 import { motion } from "framer-motion";
 import { CheckCircle2, Circle, Trophy, Flame, Target } from "lucide-react";
+import React, { useEffect, useRef, useState } from 'react';
+import type { Contract } from "ethers";
+import { contractActions, fetchGoalsFromContract, getGoalManagerContract } from '../lib/contracts';
 
 const weeks = [
   {
@@ -34,10 +37,133 @@ const weeks = [
   },
 ];
 
+type GoalUI = {
+  id: number;
+  creator: string;
+  desc: string;
+  rewardEth: string;
+  deadline: number;
+  partner: string;
+  status: number;
+  statusText: string;
+  totalMilestones: number;
+  completedMilestones: number;
+  selectedBidIndex: number;
+  lastProofTime: number;
+  pendingReview: boolean;
+  isOpen: boolean;
+  isMatched: boolean;
+  isInProgress: boolean;
+  isCompleted: boolean;
+  isFailed: boolean;
+  isSettled: boolean;
+  isDisputed: boolean;
+};
+
 const Growth = () => {
   const totalTasks = weeks.flatMap((w) => w.tasks).length;
   const doneTasks = weeks.flatMap((w) => w.tasks).filter((t) => t.done).length;
   const progress = Math.round((doneTasks / totalTasks) * 100);
+
+  const contractRef = useRef<Contract | null>(null);
+  const refreshInFlightRef = useRef(false);
+  const [goals, setGoals] = useState<GoalUI[]>([]);
+  const [goalsLoading, setGoalsLoading] = useState(false);
+  const [bidSubmitting, setBidSubmitting] = useState(false);
+  const [bidForm, setBidForm] = useState({
+    shareRatio: 20, // 0-100
+    mode: 1, // 0=STRICT, 1=GROWTH
+    depositEth: "0.01",
+  });
+
+  const shortenAddress = (addr: string) => {
+    if (!addr) return "-";
+    if (addr === "0x0000000000000000000000000000000000000000") return "-";
+    return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+  };
+
+  const refreshGoals = async () => {
+    if (!contractRef.current) return;
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+    setGoalsLoading(true);
+    try {
+      const next = await fetchGoalsFromContract(contractRef.current);
+      setGoals(next);
+    } catch (err) {
+      console.error("Fetch goals error:", err);
+    } finally {
+      setGoalsLoading(false);
+      refreshInFlightRef.current = false;
+    }
+  };
+
+  const handleBid = async (goalId: number) => {
+    if (bidSubmitting) return;
+    if (!bidForm.depositEth) return;
+
+    const depositEth = bidForm.depositEth.trim();
+    const shareRatio = Number(bidForm.shareRatio);
+    const mode = Number(bidForm.mode); // SettlementMode
+
+    if (!Number.isFinite(shareRatio) || shareRatio < 0 || shareRatio > 100) {
+      alert("分成比例 shareRatio 必须在 0-100 之间");
+      return;
+    }
+    if (!depositEth || Number(depositEth) <= 0) {
+      alert("保证金 depositEth 必须为大于 0 的 ETH 数额");
+      return;
+    }
+
+    setBidSubmitting(true);
+    try {
+      await contractActions.bid(goalId, shareRatio, mode, depositEth);
+      await refreshGoals();
+    } catch (err) {
+      console.error("Bid failed:", err);
+      alert("竞拍失败，请查看控制台错误信息");
+    } finally {
+      setBidSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    let contract: Contract | undefined;
+
+    const onGoalEvent = () => {
+      if (cancelled) return;
+      refreshGoals();
+    };
+
+    const init = async () => {
+      try {
+        contract = await getGoalManagerContract();
+        if (cancelled) return;
+        contractRef.current = contract;
+        await refreshGoals();
+
+        // 实时监听：任意关键状态变化都触发前端重新拉取 goals
+        contract.on("GoalCreated", onGoalEvent);
+        contract.on("ProofSubmitted", onGoalEvent);
+        contract.on("GoalSettled", onGoalEvent);
+        contract.on("GoalDisputed", onGoalEvent);
+      } catch (err) {
+        console.error("Init GoalManager listener error:", err);
+      }
+    };
+
+    init();
+
+    return () => {
+      cancelled = true;
+      if (!contract) return;
+      contract.off("GoalCreated", onGoalEvent);
+      contract.off("ProofSubmitted", onGoalEvent);
+      contract.off("GoalSettled", onGoalEvent);
+      contract.off("GoalDisputed", onGoalEvent);
+    };
+  }, []);
 
   return (
     <div className="min-h-screen pt-24 pb-12 px-6">
@@ -148,6 +274,123 @@ const Growth = () => {
               )}
             </motion.div>
           ))}
+        </div>
+
+        {/* On-chain goals */}
+        <div className="mt-12">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.05 }}
+            className="flex items-center justify-between mb-4"
+          >
+            <h2 className="font-display text-2xl font-bold">
+              链上成长<span className="text-gradient-primary">目标</span>
+            </h2>
+            {goalsLoading && <span className="text-xs text-muted-foreground">加载中...</span>}
+          </motion.div>
+
+          <div className="glass-card p-5 mb-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-2">分成比例 (%)</label>
+                <input
+                  type="number"
+                  value={bidForm.shareRatio}
+                  min={0}
+                  max={100}
+                  onChange={(e) => setBidForm((p) => ({ ...p, shareRatio: Number(e.target.value) }))}
+                  className="w-full px-4 py-3 rounded-xl bg-muted/50 border border-border/50 text-foreground placeholder:text-muted-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-2">结算模式</label>
+                <select
+                  value={bidForm.mode}
+                  onChange={(e) => setBidForm((p) => ({ ...p, mode: Number(e.target.value) }))}
+                  className="w-full px-4 py-3 rounded-xl bg-muted/50 border border-border/50 text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                >
+                  <option value={0}>STRICT（严格）</option>
+                  <option value={1}>GROWTH（成长）</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-2">保证金 (ETH)</label>
+                <input
+                  type="text"
+                  value={bidForm.depositEth}
+                  onChange={(e) => setBidForm((p) => ({ ...p, depositEth: e.target.value }))}
+                  placeholder="0.01"
+                  className="w-full px-4 py-3 rounded-xl bg-muted/50 border border-border/50 text-foreground placeholder:text-muted-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground mt-3">
+              该合约的 `createGoal` / `bid` 使用 `msg.value`，因此本页输入的奖励/押金单位均为 ETH。
+            </p>
+          </div>
+
+          <div className="space-y-4">
+            {goals.length === 0 ? (
+              <div className="text-sm text-muted-foreground glass-card p-5">
+                暂无链上目标（或尚未初始化钱包/合约地址）。
+              </div>
+            ) : (
+              goals.map((g, i) => {
+                const deadlineText = g.deadline ? new Date(g.deadline * 1000).toLocaleString() : "-";
+                const progressText = `${g.completedMilestones}/${g.totalMilestones}`;
+
+                return (
+                  <motion.div
+                    key={g.id ?? i}
+                    initial={{ opacity: 0, y: 18 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: i * 0.05 }}
+                    className="glass-card p-5 hover:border-primary/30 transition-all"
+                  >
+                    <div className="flex items-start justify-between gap-4 mb-3">
+                      <div className="min-w-0">
+                        <div className="font-display font-semibold text-lg truncate">{g.desc}</div>
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-primary/10 border border-primary/30 text-primary">
+                            {g.statusText}
+                          </span>
+                          <span className="text-xs text-muted-foreground">ID #{g.id}</span>
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <div className="text-xs text-muted-foreground">奖励</div>
+                        <div className="font-display font-bold text-primary">{g.rewardEth} ETH</div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm text-muted-foreground mb-3">
+                      <div>截止：{deadlineText}</div>
+                      <div>进度：{progressText}</div>
+                      <div>待审核：{g.pendingReview ? "是" : "否"}</div>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-xs text-muted-foreground">
+                        {g.partner ? `伙伴：${shortenAddress(g.partner)}` : "伙伴：-"}
+                      </div>
+                      <button
+                        disabled={!g.isOpen || bidSubmitting}
+                        onClick={() => handleBid(g.id)}
+                        className={`px-3 py-1.5 rounded-lg text-sm border transition-colors ${
+                          g.isOpen
+                            ? "bg-primary/10 border-primary/30 text-primary hover:bg-primary/20"
+                            : "bg-muted/30 border-border/50 text-muted-foreground cursor-not-allowed"
+                        }`}
+                      >
+                        {g.isOpen ? (bidSubmitting ? "提交中..." : "参与竞拍") : "当前不可竞拍"}
+                      </button>
+                    </div>
+                  </motion.div>
+                );
+              })
+            )}
+          </div>
         </div>
       </div>
     </div>
